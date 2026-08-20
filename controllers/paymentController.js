@@ -2,6 +2,7 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const pool = require('../config/db');
 const emailService = require('../services/emailService');
+const emailConfig = require('../config/emailConfig');
 require('dotenv').config();
 
 const razorpay = new Razorpay({
@@ -19,7 +20,8 @@ exports.createOrder = async (req, res) => {
       'pro': 1499
     };
     
-    let amount = PLANS[planId] || 1499;
+    const cleanPlanId = planId ? planId.replace(/^plan-/, '') : '';
+    let amount = PLANS[cleanPlanId] || 1499;
 
     if (!amount) {
       return res.status(400).json({ status: 'error', message: 'Invalid plan or amount' });
@@ -71,7 +73,31 @@ exports.createOrder = async (req, res) => {
 
 exports.verifyPayment = async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, clinicAdminId, planId, amount } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, amount } = req.body;
+    // Prefer authenticated user id from req.user (via protect middleware) for security
+    const clinicAdminId = req.user && req.user.id ? req.user.id : req.body.clinicAdminId;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ status: 'error', message: 'Missing required payment verification parameters' });
+    }
+
+    // ── IDEMPOTENCY GUARD ──
+    // Check if this payment or order has already been verified and processed
+    const [existingPayments] = await pool.query(
+      `SELECT id, status, invoice_number FROM saas_payments 
+       WHERE razorpay_payment_id = ? OR (razorpay_order_id = ? AND status = 'Successful') 
+       LIMIT 1`,
+      [razorpay_payment_id, razorpay_order_id]
+    );
+
+    if (existingPayments.length > 0 && existingPayments[0].status === 'Successful') {
+      console.log(`[Payment] Idempotent request: Payment ${razorpay_payment_id} was already processed.`);
+      return res.status(200).json({
+        status: 'success',
+        message: 'Payment already verified and subscription is active',
+        data: { invoiceNumber: existingPayments[0].invoice_number || 'INV-ALREADY-PROCESSED' }
+      });
+    }
 
     const body = razorpay_order_id + '|' + razorpay_payment_id;
     const expectedSignature = crypto
@@ -105,16 +131,27 @@ exports.verifyPayment = async (req, res) => {
         [razorpay_payment_id, razorpay_signature, invoiceNumber, razorpay_order_id]
       );
 
+      const dbPlanId = planId.startsWith('plan-') ? planId : `plan-${planId}`;
+      let durationDays = 30; // Default to 30 days
+      try {
+        const [planRows] = await pool.query('SELECT duration_days FROM saas_plans WHERE id = ?', [dbPlanId]);
+        if (planRows && planRows.length > 0) {
+          durationDays = planRows[0].duration_days || 30;
+        }
+      } catch (err) {
+        console.error('Error fetching plan duration:', err.message);
+      }
+
       const subId = crypto.randomUUID();
       const startDate = new Date();
       const endDate = new Date();
-      endDate.setMonth(endDate.getMonth() + 1);
+      endDate.setDate(endDate.getDate() + durationDays);
       
       await pool.query(
         `INSERT INTO saas_subscriptions (id, clinic_id, clinic_admin_id, plan_id, status, start_date, end_date, razorpay_payment_id) 
          VALUES (?, ?, ?, ?, 'Active', ?, ?, ?)
-         ON DUPLICATE KEY UPDATE status = 'Active', end_date = ?, razorpay_payment_id = ?`,
-        [subId, clinicId, clinicAdminId, planId, startDate, endDate, razorpay_payment_id, endDate, razorpay_payment_id]
+         ON DUPLICATE KEY UPDATE status = 'Active', end_date = ?, razorpay_payment_id = ?, plan_id = ?`,
+        [subId, clinicId, clinicAdminId, dbPlanId, startDate, endDate, razorpay_payment_id, endDate, razorpay_payment_id, dbPlanId]
       );
 
       await pool.query(
@@ -122,117 +159,51 @@ exports.verifyPayment = async (req, res) => {
         [clinicId]
       );
 
-      // Fetch user email to send transactional receipt email
+      // Fetch full user + clinic details to send professional payment emails
       try {
-        const [users] = await pool.query('SELECT name, email FROM users WHERE id = ?', [clinicAdminId]);
+        const [users] = await pool.query(
+          `SELECT u.name, u.email, c.clinic_name
+           FROM users u
+           LEFT JOIN clinics c ON u.clinic_id = c.id
+           WHERE u.id = ? LIMIT 1`,
+          [clinicAdminId]
+        );
         if (users.length > 0) {
           const user = users[0];
           const userName = user.name || 'Clinic Administrator';
           const userEmail = user.email;
+          const clinicName = user.clinic_name || 'PetCare Pro Clinic';
 
-          // Map plan ID to beautiful plan name
-          const planMap = {
-            basic: 'Basic Plan',
-            pro: 'Pro Plan',
-            enterprise: 'Enterprise Plan'
+          // Resolve plan name from DB (already queried above for durationDays)
+          let planNameFinal = planId;
+          try {
+            const [planRows] = await pool.query('SELECT name FROM saas_plans WHERE id = ? LIMIT 1', [dbPlanId]);
+            if (planRows && planRows.length > 0) planNameFinal = planRows[0].name || planId;
+          } catch (e) { /* non-fatal */ }
+
+          const purchasePayload = {
+            adminName: userName,
+            clinicName,
+            email: userEmail,
+            planName: planNameFinal,
+            amount: amount || (durationDays === 30 ? 999 : 1499),
+            razorpayPaymentId: razorpay_payment_id,
+            razorpayOrderId: razorpay_order_id,
+            invoiceNumber,
+            startDate,
+            endDate,
+            billingCycle: `${durationDays} Days`,
+            purchasedAt: new Date()
           };
-          const planName = planMap[planId] || `${planId.toUpperCase()} Plan`;
-          
-          const now = new Date();
-          const formattedDate = `${now.getDate()}/${now.getMonth() + 1}/${now.getFullYear()}`;
 
-          const receiptHtml = `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
-              <div style="background-color: #0f172a; padding: 1.5rem; text-align: center;">
-                <span style="color: #ffffff; font-weight: 800; font-size: 1.25rem; letter-spacing: 0.5px;">KIAAN</span>
-                <span style="color: #2dd4bf; font-weight: 800; font-size: 1.25rem; letter-spacing: 0.5px;">VETERINARY</span>
-              </div>
-              <div style="padding: 2rem;">
-                <div style="display: inline-block; background-color: #dcfce7; color: #15803d; font-size: 0.75rem; font-weight: 700; padding: 0.35rem 0.75rem; border-radius: 4px; text-transform: uppercase; margin-bottom: 1.25rem;">
-                  Payment Successful
-                </div>
-                <h2 style="font-size: 1.25rem; font-weight: 700; color: #0f172a; margin-top: 0; margin-bottom: 0.5rem;">Payment Receipt #${razorpay_payment_id}</h2>
-                <p style="color: #475569; font-size: 0.9rem; line-height: 1.5; margin-bottom: 1.5rem;">Thank you for your payment. Here is your transaction summary for ${userName}:</p>
-                
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem;">
-                  <thead>
-                    <tr style="border-bottom: 2px solid #e2e8f0; color: #64748b; font-weight: 700;">
-                      <th style="padding: 0.5rem 0;">DESCRIPTION</th>
-                      <th style="padding: 0.5rem 0; text-align: right;">AMOUNT</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr style="border-bottom: 1px solid #f1f5f9;">
-                      <td style="padding: 0.75rem 0; color: #0f172a; font-weight: 600;">Plan: ${planName}</td>
-                      <td style="padding: 0.75rem 0; text-align: right; color: #0f172a; font-weight: 600;">₹${amount}</td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #f1f5f9;">
-                      <td style="padding: 0.75rem 0; color: #64748b;">Transaction ID</td>
-                      <td style="padding: 0.75rem 0; text-align: right; color: #334155; font-family: monospace;">${razorpay_payment_id}</td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #f1f5f9;">
-                      <td style="padding: 0.75rem 0; color: #64748b;">Payment Method</td>
-                      <td style="padding: 0.75rem 0; text-align: right; color: #334155;">Razorpay</td>
-                    </tr>
-                    <tr>
-                      <td style="padding: 0.75rem 0; color: #64748b;">Date</td>
-                      <td style="padding: 0.75rem 0; text-align: right; color: #334155;">${formattedDate}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div style="background-color: #f8fafc; padding: 1rem; text-align: center; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 0.75rem;">
-                © 2026 Kiaan Veterinary SaaS Platform. All rights reserved.
-              </div>
-            </div>
-          `;
+          // Admin receipt email
+          await emailService.sendPlanPurchaseEmail(purchasePayload);
 
-          const saEmail = process.env.SUPERADMIN_NOTIFY_EMAIL || 'info@kiaantechnology.com';
-          await emailService.sendEmail({
-            to: userEmail,
-            bcc: saEmail,
-            subject: `Payment Receipt #${razorpay_payment_id} - Kiaan Veterinary`,
-            text: `Thank you for your payment. Receipt ID: ${razorpay_payment_id}. Plan: ${planName}, Amount: ₹${amount}`,
-            html: receiptHtml
-          });
-
-          // Notify Super Admin about payment
-          // saEmail is already declared above
-
-          const saPaymentHtml = `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
-              <div style="background: #0f172a; padding: 1.25rem; text-align: center;">
-                <span style="color: #fff; font-weight: 800; font-size: 1.1rem;">KIAAN <span style="color: #2dd4bf;">VETERINARY</span> — Payment Alert</span>
-              </div>
-              <div style="padding: 1.5rem;">
-                <div style="background: #dcfce7; border: 1px solid #86efac; border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem; color: #15803d; font-weight: 700; font-size: 0.95rem;">
-                  ✅ Payment Successful — Plan Activated
-                </div>
-                <table style="width: 100%; font-size: 0.9rem; border-collapse: collapse; background: #f8fafc;">
-                  <tr><td style="padding: 8px 12px; color: #64748b;">Admin Name:</td><td style="padding: 8px 12px; font-weight: 700; color: #0f172a;">${userName}</td></tr>
-                  <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Email:</td><td style="padding: 8px 12px; color: #0f172a;">${userEmail}</td></tr>
-                  <tr><td style="padding: 8px 12px; color: #64748b;">Plan Purchased:</td><td style="padding: 8px 12px; font-weight: 700; color: #0d9488;">${planName}</td></tr>
-                  <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Amount Paid:</td><td style="padding: 8px 12px; font-weight: 700; color: #0f172a;">₹${amount}</td></tr>
-                  <tr><td style="padding: 8px 12px; color: #64748b;">Payment ID:</td><td style="padding: 8px 12px; font-family: monospace; color: #334155;">${razorpay_payment_id}</td></tr>
-                  <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Invoice No:</td><td style="padding: 8px 12px; font-family: monospace; color: #334155;">${invoiceNumber}</td></tr>
-                  <tr><td style="padding: 8px 12px; color: #64748b;">Plan Valid Till:</td><td style="padding: 8px 12px; font-weight: 700; color: #c2410c;">${endDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}</td></tr>
-                  <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Payment Date:</td><td style="padding: 8px 12px; color: #0f172a;">${new Date().toLocaleString('en-IN')}</td></tr>
-                </table>
-              </div>
-              <div style="background: #f8fafc; padding: 0.75rem; text-align: center; color: #94a3b8; font-size: 0.75rem;">
-                Kiaan Veterinary SaaS Platform — Super Admin Payment Notification
-              </div>
-            </div>
-          `;
-          await emailService.sendEmail({
-            to: saEmail,
-            subject: `💳 Payment Received: ${planName} — ₹${amount} from ${userName} — ${formattedDate}`,
-            text: `Payment received. Admin: ${userName} (${userEmail}). Plan: ${planName}. Amount: ₹${amount}. Payment ID: ${razorpay_payment_id}.`,
-            html: saPaymentHtml
-          });
+          // SuperAdmin notification email
+          await emailService.sendSuperAdminPurchaseNotification(purchasePayload);
         }
       } catch (emailErr) {
-        console.error('Failed to send payment receipt email:', emailErr);
+        console.error('Failed to send payment receipt email:', emailErr.message);
       }
 
       res.status(200).json({

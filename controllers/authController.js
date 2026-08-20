@@ -3,6 +3,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const emailService = require('../services/emailService');
+const { SUPERADMIN_EMAIL } = require('../config/emailConfig');
 
 // @desc    Authenticate user & get token
 // @route   POST /api/auth/login
@@ -45,6 +46,7 @@ const loginUser = async (req, res) => {
         // Fetch subscription info
         let subscription_status = 'active';
         let trial_end_date = null;
+        let isPaidPlan = false;
         if (user.clinic_id) {
             const [subs] = await db.query('SELECT * FROM saas_subscriptions WHERE clinic_id = ? ORDER BY created_at DESC LIMIT 1', [user.clinic_id]);
             if (subs.length > 0) {
@@ -53,6 +55,7 @@ const loginUser = async (req, res) => {
                     subscription_status = 'trial';
                 } else {
                     subscription_status = sub.status === 'Active' ? 'active' : 'expired';
+                    isPaidPlan = true;
                 }
                 trial_end_date = sub.end_date;
             }
@@ -71,7 +74,8 @@ const loginUser = async (req, res) => {
                     profile_image: user.profile_image,
                     clinic_id: user.clinic_id,
                     subscription_status,
-                    trial_end_date
+                    trial_end_date,
+                    isPaidPlan
                 }
             }
         });
@@ -154,19 +158,33 @@ const registerUser = async (req, res) => {
         const saltRounds = 10;
         const passwordHash = await bcrypt.hash(password, saltRounds);
 
-        // 5. Calculate Trial Dates
-        const trialStartDate = new Date();
-        const trialExpiryDate = new Date();
-        trialExpiryDate.setDate(trialStartDate.getDate() + 7);
-        // 6. Insert Clinic, Admin User, and Subscription records into Database (using transaction for consistency)
+        // 5. Fetch Plan Details & Features from Database
+        const planId = selectedPlan.startsWith('plan-') ? selectedPlan : `plan-${selectedPlan}`;
+        const [planRows] = await db.query('SELECT * FROM saas_plans WHERE id = ?', [planId]);
+        const planRecord = planRows && planRows.length > 0 ? planRows[0] : null;
+
+        const isTrial = planId === 'plan-free-trial' || selectedPlan === 'free-trial';
+        const durationDays = planRecord && planRecord.duration_days ? planRecord.duration_days : (isTrial ? 7 : 30);
+        const planName = planRecord && planRecord.name ? planRecord.name : (isTrial ? '7-Day Free Trial' : 'Pro Plan');
+        const planPrice = planRecord && planRecord.price !== undefined ? planRecord.price : (isTrial ? 0 : 1499);
+
+        const { parseFeatures } = require('../services/subscriptionService');
+        const planFeatures = parseFeatures(planRecord ? planRecord.features : null);
+
+        // 6. Calculate Subscription Start & End Dates
+        const subscriptionStartDate = new Date();
+        const subscriptionEndDate = new Date();
+        subscriptionEndDate.setDate(subscriptionStartDate.getDate() + durationDays);
+
+        // 7. Insert Clinic, Admin User, and Subscription records into Database (using transaction for consistency)
         const connection = await db.getConnection();
         try {
             await connection.beginTransaction();
 
             // Insert Clinic
             await connection.query(
-                `INSERT INTO clinics (id, clinic_name, email, phone, status) VALUES (?, ?, ?, ?, 'TRIAL')`,
-                [tenantId, businessName.trim(), email.trim().toLowerCase(), mobileClean]
+                `INSERT INTO clinics (id, clinic_name, email, phone, status) VALUES (?, ?, ?, ?, ?)`,
+                [tenantId, businessName.trim(), email.trim().toLowerCase(), mobileClean, isTrial ? 'TRIAL' : 'ACTIVE']
             );
 
             // Insert Admin User
@@ -177,15 +195,13 @@ const registerUser = async (req, res) => {
                 [userId, adminName.trim(), email.trim().toLowerCase(), mobileClean, username, passwordHash, tenantId]
             );
 
-            // Map selectedPlan key to plan_id in DB
-            const planId = selectedPlan.startsWith('plan-') ? selectedPlan : `plan-${selectedPlan}`;
             const subscriptionId = crypto.randomUUID ? crypto.randomUUID() : `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
             // Insert SaaS Subscription
             await connection.query(
                 `INSERT INTO saas_subscriptions (id, clinic_id, clinic_admin_id, plan_id, status, start_date, end_date) 
-                 VALUES (?, ?, ?, ?, 'Trial', ?, ?)`,
-                [subscriptionId, tenantId, userId, planId, 'Trial', trialStartDate, trialExpiryDate]
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [subscriptionId, tenantId, userId, planId, isTrial ? 'Trial' : 'Active', subscriptionStartDate, subscriptionEndDate]
             );
 
             await connection.commit();
@@ -196,119 +212,80 @@ const registerUser = async (req, res) => {
             connection.release();
         }
 
-        // Send Welcome email with credentials + plan details
+        // 8. Send Welcome email with real database account + subscription details
         try {
-            const formattedExpiry = trialExpiryDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
-            const loginUrl = (process.env.FRONTEND_URL || 'http://localhost:5174') + '/login';
-            const saNotifyEmail = process.env.SUPERADMIN_NOTIFY_EMAIL || 'info@kiaantechnology.com';
+            const frontendBase = (process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5174').trim().replace(/\/+$/, '');
+            const loginUrl = `${frontendBase}/login`;
+            const saNotifyEmail = SUPERADMIN_EMAIL;
 
-            const welcomeHtml = `
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; background-color: #f8fafc;">
-                  <div style="background-color: #0d9488; padding: 1.5rem; color: #ffffff;">
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                      <span style="font-size: 1.5rem;">🐾</span>
-                      <strong style="font-size: 1.25rem;">Kiaan Veterinary</strong>
-                    </div>
-                    <div style="font-size: 0.75rem; opacity: 0.9; margin-top: 4px;">Official Notification</div>
-                  </div>
-                  <div style="padding: 2rem; background-color: #ffffff;">
-                    <h3 style="color: #1e293b; font-size: 1.15rem; margin-top: 0; margin-bottom: 1.5rem;">Welcome to Kiaan Veterinary - Your Account is Ready</h3>
-                    
-                    <p style="color: #334155; margin-bottom: 1.25rem; font-size: 0.9rem;">Hello ${adminName.trim()},</p>
-                    <p style="color: #334155; margin-bottom: 1.25rem; font-size: 0.9rem;">Welcome to Kiaan Veterinary.</p>
-                    <p style="color: #334155; margin-bottom: 2rem; font-size: 0.9rem;">Your account and plan subscription have been successfully activated.</p>
-                    
-                    <div style="margin-bottom: 1.5rem;">
-                      <p style="color: #475569; font-size: 0.9rem; margin-bottom: 0.75rem;">Account Details:</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Name: ${adminName.trim()}</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Email / Login ID: <a href="mailto:${email.trim().toLowerCase()}" style="color: #3b82f6; text-decoration: none;">${email.trim().toLowerCase()}</a></p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Password: ${password}</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Software: Kiaan Veterinary</p>
-                    </div>
-
-                    <div style="margin-bottom: 1.5rem;">
-                      <p style="color: #475569; font-size: 0.9rem; margin-bottom: 0.75rem;">Plan Details:</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Plan: 7-Day Free Trial</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Price: ₹0.00</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Duration: 7 Days</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Start Date: ${trialStartDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</p>
-                      <p style="color: #334155; font-size: 0.9rem; margin: 0.4rem 0;">Expiry Date: ${trialExpiryDate.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</p>
-                    </div>
-
-                    <div style="margin-bottom: 1.5rem;">
-                      <p style="color: #475569; font-size: 0.9rem; margin-bottom: 0.75rem;">Login:</p>
-                      <p style="margin: 0.4rem 0; font-size: 0.9rem;"><a href="${loginUrl}" style="color: #3b82f6; text-decoration: none;">${loginUrl}</a></p>
-                    </div>
-
-                    <p style="color: #334155; margin-bottom: 1.5rem; font-size: 0.9rem;">Please keep your login credentials secure.</p>
-                    
-                    <p style="color: #334155; font-size: 0.9rem; margin: 0;">Thank you,</p>
-                    <p style="color: #334155; font-size: 0.9rem; margin: 0.2rem 0 0 0;">Kiaan Technology Pvt Ltd</p>
-                  </div>
-                  <div style="background-color: #f1f5f9; padding: 1rem; color: #94a3b8; font-size: 0.75rem; text-align: left;">
-                    This is an automated message from Kiaan Veterinary. Please do not reply.
-                  </div>
-                </div>
-            `;
-
-            // 1. Welcome email to new admin
-            await emailService.sendEmail({
-                to: email.trim().toLowerCase(),
-                bcc: saNotifyEmail,
-                subject: `Welcome to Kiaan Veterinary - Your Account is Ready`,
-                text: `Welcome ${adminName.trim()}! Your account is ready.\nEmail: ${email.trim().toLowerCase()}\nPassword: ${password}\nTrial Expires: ${formattedExpiry}\nLogin at: ${loginUrl}`,
-                html: welcomeHtml
+            // Send standardized Welcome Email to new Admin
+            await emailService.sendWelcomeEmail({
+                adminName: adminName.trim(),
+                email: email.trim().toLowerCase(),
+                clinicName: businessName.trim(),
+                planName,
+                price: planPrice,
+                durationDays,
+                startDate: subscriptionStartDate,
+                endDate: subscriptionEndDate,
+                isTrial,
+                features: planFeatures,
+                loginUrl
             });
+            console.log(`[Registration] Welcome email dispatched successfully for: ${email.trim().toLowerCase()}`);
 
-            // 2. Notify super admin about new registration
+            // Send notification to SuperAdmin
+            const formattedExpiry = subscriptionEndDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
             const saNotifyHtml = `
                 <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
                   <div style="background: #0f172a; padding: 1.25rem; text-align: center;">
-                    <span style="color: #fff; font-weight: 800; font-size: 1.1rem;">KIAAN <span style="color: #2dd4bf;">VETERINARY</span> — Admin Panel</span>
+                    <span style="color: #fff; font-weight: 800; font-size: 1.1rem;">PETCARE <span style="color: #2dd4bf;">PRO</span> — Admin Alert</span>
                   </div>
                   <div style="padding: 1.5rem;">
                     <h2 style="color: #0f172a; font-size: 1.1rem; margin-top: 0;">🆕 New Clinic Registration Alert</h2>
-                    <p style="color: #475569; font-size: 0.9rem;">A new clinic admin has registered on the platform:</p>
+                    <p style="color: #475569; font-size: 0.9rem;">A new clinic admin has registered on the PetCare Pro platform:</p>
                     <table style="width: 100%; font-size: 0.9rem; border-collapse: collapse; background: #f8fafc; border-radius: 8px;">
                       <tr><td style="padding: 8px 12px; color: #64748b;">Admin Name:</td><td style="padding: 8px 12px; font-weight: 700; color: #0f172a;">${adminName.trim()}</td></tr>
                       <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Email:</td><td style="padding: 8px 12px; color: #0f172a;">${email.trim().toLowerCase()}</td></tr>
                       <tr><td style="padding: 8px 12px; color: #64748b;">Clinic Name:</td><td style="padding: 8px 12px; font-weight: 700; color: #0f172a;">${businessName.trim()}</td></tr>
                       <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Mobile:</td><td style="padding: 8px 12px; color: #0f172a;">${mobileClean}</td></tr>
-                      <tr><td style="padding: 8px 12px; color: #64748b;">Plan:</td><td style="padding: 8px 12px; color: #b45309; font-weight: 700;">7-Day Free Trial</td></tr>
-                      <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Trial Expires:</td><td style="padding: 8px 12px; color: #dc2626; font-weight: 700;">${formattedExpiry}</td></tr>
+                      <tr><td style="padding: 8px 12px; color: #64748b;">Plan:</td><td style="padding: 8px 12px; color: #0d9488; font-weight: 700;">${planName}</td></tr>
+                      <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Duration / Expiry:</td><td style="padding: 8px 12px; color: #dc2626; font-weight: 700;">${formattedExpiry} (${durationDays} Days)</td></tr>
                       <tr><td style="padding: 8px 12px; color: #64748b;">Admin ID:</td><td style="padding: 8px 12px; font-family: monospace; color: #334155;">${adminId}</td></tr>
                       <tr style="background:#fff;"><td style="padding: 8px 12px; color: #64748b;">Registered At:</td><td style="padding: 8px 12px; color: #0f172a;">${new Date().toLocaleString('en-IN')}</td></tr>
                     </table>
                   </div>
                   <div style="background: #f8fafc; padding: 0.75rem; text-align: center; color: #94a3b8; font-size: 0.75rem;">
-                    Kiaan Veterinary SaaS Platform — Super Admin Notification
+                    PetCare Pro SaaS Platform — Super Admin Notification
                   </div>
                 </div>
             `;
             await emailService.sendEmail({
                 to: saNotifyEmail,
                 subject: `🆕 New Clinic Registered: ${businessName.trim()} — ${new Date().toLocaleDateString('en-IN')}`,
-                text: `New clinic registered: ${businessName.trim()} by ${adminName.trim()} (${email.trim().toLowerCase()}). Trial expires: ${formattedExpiry}`,
+                text: `New clinic registered: ${businessName.trim()} by ${adminName.trim()} (${email.trim().toLowerCase()}). Plan: ${planName}. Expires: ${formattedExpiry}`,
                 html: saNotifyHtml
             });
 
         } catch (emailErr) {
-            console.error('Failed to send registration emails:', emailErr);
+            console.error(`[Email] Welcome email failed for: ${email.trim().toLowerCase()}:`, emailErr.message);
         }
 
-        // 7. Return Structured Response
+        // 9. Return Structured Response
         res.status(201).json({
             status: 'success',
             message: 'Clinic registered successfully',
             data: {
                 adminId,
                 tenantId,
+                userId,
                 email: email.trim().toLowerCase(),
                 adminName: adminName.trim(),
                 businessName: businessName.trim(),
                 selectedPlan,
-                trialStartDate,
-                trialExpiryDate
+                isPaidPlan: !isTrial,
+                trialStartDate: subscriptionStartDate,
+                trialExpiryDate: subscriptionEndDate
             }
         });
     } catch (error) {

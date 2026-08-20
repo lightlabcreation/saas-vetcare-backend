@@ -30,10 +30,17 @@ const createPet = async (req, res) => {
         if (!ownerId || !name || !species) {
             return res.status(400).json({ status: 'error', message: 'Owner, Pet Name, and Species are mandatory' });
         }
-        if (weight && isNaN(Number(weight))) {
-            return res.status(400).json({ status: 'error', message: 'Weight must be a valid number' });
+        
+        let parsedWeight = null;
+        if (weight !== undefined && weight !== null && String(weight).trim() !== '') {
+            const cleaned = String(weight).replace(/[^0-9.]/g, '');
+            if (cleaned && !isNaN(parseFloat(cleaned))) {
+                parsedWeight = parseFloat(cleaned);
+            }
         }
-        const newPet = await petService.createPet(req.user.clinic_id, req.body);
+        
+        const petData = { ...req.body, weight: parsedWeight };
+        const newPet = await petService.createPet(req.user.clinic_id, petData);
 
         // ── In-App Notification ───────────────────────────────────────────
         try {
@@ -69,10 +76,17 @@ const updatePet = async (req, res) => {
         if (!ownerId || !name || !species) {
             return res.status(400).json({ status: 'error', message: 'Owner, Pet Name, and Species are mandatory' });
         }
-        if (weight && isNaN(Number(weight))) {
-            return res.status(400).json({ status: 'error', message: 'Weight must be a valid number' });
+        
+        let parsedWeight = null;
+        if (weight !== undefined && weight !== null && String(weight).trim() !== '') {
+            const cleaned = String(weight).replace(/[^0-9.]/g, '');
+            if (cleaned && !isNaN(parseFloat(cleaned))) {
+                parsedWeight = parseFloat(cleaned);
+            }
         }
-        const updated = await petService.updatePet(req.user.clinic_id, req.params.id, req.body);
+        
+        const petData = { ...req.body, weight: parsedWeight };
+        const updated = await petService.updatePet(req.user.clinic_id, req.params.id, petData);
         if (!updated) return res.status(404).json({ status: 'error', message: 'Pet not found' });
         res.json({ status: 'success', data: updated });
     } catch (error) {
@@ -126,7 +140,7 @@ const uploadPetPhoto = async (req, res) => {
         const filePath = path.join(uploadDir, uniqueName);
         fs.writeFileSync(filePath, buffer);
 
-        const publicUrl = `http://localhost:5000/uploads/${uniqueName}`;
+        const publicUrl = `/uploads/${uniqueName}`;
         res.status(200).json({ status: 'success', data: { url: publicUrl } });
     } catch (error) {
         console.error('Error uploading pet photo:', error);

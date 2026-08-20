@@ -225,10 +225,184 @@ const activateClinic = async (req, res) => {
     }
 };
 
+// @desc    Get Payments / Transactions
+// @route   GET /api/super-admin/payments
+// @access  Private (SUPER_ADMIN)
+const getPayments = async (req, res) => {
+    try {
+        const [payments] = await db.query(`
+            SELECT 
+                p.id,
+                p.razorpay_order_id as orderId,
+                p.razorpay_payment_id as paymentId,
+                p.amount,
+                p.currency,
+                p.status,
+                p.payment_method as method,
+                p.invoice_number as invoice,
+                p.payment_date as date,
+                c.clinic_name as clinic,
+                u.email as admin_email
+            FROM saas_payments p
+            LEFT JOIN clinics c ON c.id = p.clinic_id
+            LEFT JOIN users u ON u.id = p.clinic_admin_id
+            ORDER BY p.payment_date DESC
+        `);
+
+        const formatted = payments.map(p => ({
+            id: p.id,
+            orderId: p.orderId || '-',
+            paymentId: p.paymentId || '-',
+            clinic: p.clinic || 'General Clinic',
+            email: p.admin_email || '-',
+            date: p.date ? new Date(p.date).toLocaleString('en-IN') : '-',
+            amount: `₹${Number(p.amount || 0).toLocaleString('en-IN')}`,
+            method: p.method ? `Razorpay (${p.method})` : 'Razorpay Gateway',
+            status: p.status || 'Pending',
+            invoice: p.invoice || '-'
+        }));
+
+        res.json({ status: 'success', data: formatted });
+    } catch (error) {
+        console.error('Error fetching superadmin payments:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch payments' });
+    }
+};
+
+// @desc    Get Subscriptions
+// @route   GET /api/super-admin/subscriptions
+// @access  Private (SUPER_ADMIN)
+const getSubscriptions = async (req, res) => {
+    try {
+        const [subs] = await db.query(`
+            SELECT 
+                s.id,
+                s.status,
+                s.start_date,
+                s.end_date,
+                s.created_at,
+                c.clinic_name,
+                c.email,
+                p.name as plan_name,
+                p.price as plan_price,
+                p.duration_days
+            FROM saas_subscriptions s
+            LEFT JOIN clinics c ON c.id = s.clinic_id
+            LEFT JOIN saas_plans p ON p.id = s.plan_id
+            ORDER BY s.created_at DESC
+        `);
+
+        const formatted = subs.map(s => ({
+            id: s.id,
+            clinicName: s.clinic_name || 'Clinic',
+            email: s.email || '-',
+            plan: s.plan_name || 'Standard',
+            status: s.status || 'Active',
+            billingCycle: s.duration_days > 30 ? 'Annual' : 'Monthly',
+            nextBilling: s.end_date ? new Date(s.end_date).toISOString().split('T')[0] : '-',
+            amount: `₹${Number(s.plan_price || 0).toLocaleString('en-IN')}`
+        }));
+
+        res.json({ status: 'success', data: formatted });
+    } catch (error) {
+        console.error('Error fetching subscriptions:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch subscriptions' });
+    }
+};
+
+// @desc    Get Plans
+// @route   GET /api/super-admin/plans
+// @access  Private (SUPER_ADMIN)
+const getPlans = async (req, res) => {
+    try {
+        const [plans] = await db.query('SELECT * FROM saas_plans ORDER BY price ASC');
+        const formatted = plans.map(p => ({
+            id: p.id,
+            name: p.name,
+            price: `₹${Number(p.price || 0).toLocaleString('en-IN')}`,
+            priceRaw: Number(p.price || 0),
+            interval: p.duration_days === 7 ? '7 days trial' : (p.duration_days > 30 ? 'per year' : 'per month'),
+            duration_days: p.duration_days,
+            features: p.features ? (typeof p.features === 'string' ? JSON.parse(p.features) : p.features) : [],
+            color: p.name.toLowerCase().includes('trial') ? '#f59e0b' : (p.name.toLowerCase().includes('pro') ? '#8b5cf6' : '#14b8a6'),
+            badgeText: p.name.toLowerCase().includes('trial') ? 'Trial Plan' : (p.name.toLowerCase().includes('pro') ? 'Unlimited' : 'Most Popular'),
+            isPopular: p.name.toLowerCase().includes('standard') || p.name.toLowerCase().includes('pro')
+        }));
+
+        res.json({ status: 'success', data: formatted });
+    } catch (error) {
+        console.error('Error fetching plans for superadmin:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch plans' });
+    }
+};
+
+// @desc    Get SuperAdmin Notifications
+// @route   GET /api/super-admin/notifications
+// @access  Private (SUPER_ADMIN)
+const getNotifications = async (req, res) => {
+    try {
+        const [recentClinics] = await db.query('SELECT clinic_name, created_at FROM clinics ORDER BY created_at DESC LIMIT 5');
+        const [recentPayments] = await db.query('SELECT amount, payment_date FROM saas_payments WHERE status = "Successful" ORDER BY payment_date DESC LIMIT 5');
+        const [recentTickets] = await db.query('SELECT subject, priority, created_at FROM saas_support_tickets ORDER BY created_at DESC LIMIT 5');
+
+        const notifs = [];
+        let idCounter = 1;
+
+        recentClinics.forEach(c => {
+            notifs.push({
+                id: idCounter++,
+                type: 'user',
+                title: 'New Clinic Registered',
+                desc: `${c.clinic_name} registered on the platform.`,
+                time: new Date(c.created_at).toLocaleDateString('en-IN'),
+                iconName: 'UserPlus',
+                color: '#34d399',
+                bg: 'rgba(52,211,153,0.1)'
+            });
+        });
+
+        recentPayments.forEach(p => {
+            notifs.push({
+                id: idCounter++,
+                type: 'billing',
+                title: 'Payment Received',
+                desc: `Received subscription payment of ₹${Number(p.amount || 0).toLocaleString('en-IN')}`,
+                time: new Date(p.payment_date).toLocaleDateString('en-IN'),
+                iconName: 'CreditCard',
+                color: '#38bdf8',
+                bg: 'rgba(56,189,248,0.1)'
+            });
+        });
+
+        recentTickets.forEach(t => {
+            notifs.push({
+                id: idCounter++,
+                type: 'alert',
+                title: 'Support Ticket Raised',
+                desc: `${t.subject} [Priority: ${t.priority}]`,
+                time: new Date(t.created_at).toLocaleDateString('en-IN'),
+                iconName: 'ShieldAlert',
+                color: '#facc15',
+                bg: 'rgba(250,204,21,0.1)'
+            });
+        });
+
+        res.json({ status: 'success', data: notifs });
+    } catch (error) {
+        console.error('Error fetching notifications:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch notifications' });
+    }
+};
+
 module.exports = {
     loginSuperAdmin,
     getClinics,
     getStats,
     suspendClinic,
-    activateClinic
+    activateClinic,
+    getPayments,
+    getSubscriptions,
+    getPlans,
+    getNotifications
 };
+

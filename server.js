@@ -6,7 +6,7 @@ require('dotenv').config();
 
 const app = express();
 app.set('trust proxy', 1);
-const port = process.env.PORT || 5000;
+const port = 5002;
 
 // Security Headers
 app.use(helmet({
@@ -82,6 +82,7 @@ const paymentRoutes = require('./routes/paymentRoutes');
 const supportTicketRoutes = require('./routes/supportTicketRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
 const hospitalizationRoutes = require('./routes/hospitalizationRoutes');
+const subscriptionRoutes = require('./routes/subscriptionRoutes');
 
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/v1/auth', authLimiter, authRoutes);
@@ -103,6 +104,7 @@ app.use('/api/v1/assistance-tasks', protect, subscriptionMiddleware, assistanceT
 app.use('/api/v1/support-tickets', protect, subscriptionMiddleware, supportTicketRoutes);
 app.use('/api/v1/dashboard', protect, subscriptionMiddleware, dashboardRoutes);
 app.use('/api/v1/hospitalization', protect, subscriptionMiddleware, hospitalizationRoutes);
+app.use('/api/subscriptions', protect, subscriptionRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/payment', paymentLimiter, paymentRoutes);
 
@@ -118,8 +120,20 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
+const cron = require('node-cron');
+const { checkAndNotifyExpiries } = require('./services/subscriptionService');
+
 // Global Error Handler
 app.use(errorHandler);
+
+// Schedule Daily Expiry Check at 12:01 AM with configured timezone (defaults to Asia/Kolkata / Server Local)
+const cronTimezone = process.env.CRON_TIMEZONE || 'Asia/Kolkata';
+cron.schedule('1 0 * * *', () => {
+    console.log(`[Cron] Triggered daily expiry check at 12:01 AM (${cronTimezone})`);
+    checkAndNotifyExpiries();
+}, {
+    timezone: cronTimezone
+});
 
 // Start Server
 app.listen(port, () => {

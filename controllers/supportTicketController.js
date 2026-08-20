@@ -1,7 +1,8 @@
 const db = require('../config/db');
 const emailService = require('../services/emailService');
+const { SUPPORT_EMAIL, resolveTicketUrl } = require('../config/emailConfig');
 
-// Helper to format date
+// Helper to format date and time
 const getFormattedDate = () => {
     const now = new Date();
     return `${String(now.getDate()).padStart(2, "0")}/${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getFullYear()).substring(2)}`;
@@ -19,22 +20,113 @@ const createTicket = async (req, res) => {
     try {
         const { subject, description, priority = 'Medium', category = 'Technical' } = req.body;
         const userId = req.user?.id || null;
-        const adminName = req.user?.name || req.user?.email || 'Admin User';
-        const email = req.user?.email || 'admin@clinic.com';
-        
-        // Find clinic/admin details from user row or defaults
-        const clinicName = req.user?.clinicName || 'My Veterinary Clinic';
+        const fallbackEmail = req.user?.email || '';
 
-        if (!subject || !description) {
+        if (!subject || !subject.trim() || !description || !description.trim()) {
             return res.status(400).json({ status: 'error', message: 'Subject and description are required.' });
         }
 
+        const trimmedSubject = subject.trim();
+        const trimmedDescription = description.trim();
+
+        // ── 1. Idempotency / Double-submit Guard (30-second debounce) ──
+        if (userId || fallbackEmail) {
+            const [recentTickets] = await db.query(
+                `SELECT id, subject, priority, category, status, updated, messages, created_at
+                 FROM saas_support_tickets
+                 WHERE (clinic_admin_id = ? OR email = ?)
+                   AND subject = ?
+                   AND created_at >= NOW() - INTERVAL 30 SECOND
+                 ORDER BY created_at DESC LIMIT 1`,
+                [userId, fallbackEmail, trimmedSubject]
+            );
+
+            if (recentTickets && recentTickets.length > 0) {
+                const existing = recentTickets[0];
+                console.log(`[SupportTicket] Debounced duplicate ticket creation for user: ${userId || fallbackEmail}`);
+                return res.status(200).json({
+                    status: 'success',
+                    message: 'Support ticket already submitted.',
+                    data: {
+                        id: existing.id,
+                        subject: existing.subject,
+                        priority: existing.priority,
+                        category: existing.category,
+                        status: existing.status,
+                        updated: existing.updated,
+                        messages: typeof existing.messages === 'string' ? JSON.parse(existing.messages) : existing.messages
+                    }
+                });
+            }
+        }
+
+        // ── 2. Fetch Real User, Clinic & Subscription Metadata from Database ──
+        let adminName = req.user?.name || req.user?.email || 'Clinic Admin';
+        let email = fallbackEmail;
+        let phone = req.user?.phone || null;
+        let clinicId = req.user?.clinic_id || null;
+        let clinicName = 'PetCare Pro Clinic';
+        let planName = 'Standard Plan';
+        let subscriptionStatus = 'Active';
+        let subscriptionStartDate = null;
+        let subscriptionEndDate = null;
+
+        if (userId) {
+            try {
+                const [userRows] = await db.query(
+                    `SELECT u.id, u.name, u.email, u.phone, u.clinic_id,
+                            c.clinic_name, c.status as clinic_status
+                     FROM users u
+                     LEFT JOIN clinics c ON u.clinic_id = c.id
+                     WHERE u.id = ? LIMIT 1`,
+                    [userId]
+                );
+                if (userRows && userRows.length > 0) {
+                    const u = userRows[0];
+                    if (u.name) adminName = u.name;
+                    if (u.email) email = u.email;
+                    if (u.phone) phone = u.phone;
+                    if (u.clinic_id) clinicId = u.clinic_id;
+                    if (u.clinic_name) clinicName = u.clinic_name;
+                }
+            } catch (err) {
+                console.error('[SupportTicket] Error fetching user/clinic details:', err.message);
+            }
+        }
+
+        // Fetch subscription information for this clinic
+        const clinicIdToQuery = clinicId || req.user?.clinic_id;
+        if (clinicIdToQuery) {
+            try {
+                const [subRows] = await db.query(
+                    `SELECT s.id, s.status, s.start_date, s.end_date, p.name as plan_name
+                     FROM saas_subscriptions s
+                     LEFT JOIN saas_plans p ON s.plan_id = p.id
+                     WHERE s.clinic_id = ?
+                     ORDER BY CASE WHEN s.status IN ('Active', 'Trial') THEN 1 ELSE 2 END, s.end_date DESC
+                     LIMIT 1`,
+                    [clinicIdToQuery]
+                );
+                if (subRows && subRows.length > 0) {
+                    const s = subRows[0];
+                    if (s.plan_name) planName = s.plan_name;
+                    if (s.status) subscriptionStatus = s.status;
+                    subscriptionStartDate = s.start_date;
+                    subscriptionEndDate = s.end_date;
+                }
+            } catch (subErr) {
+                console.error('[SupportTicket] Error fetching subscription details:', subErr.message);
+            }
+        }
+
+        // ── 3. Insert Ticket into Database ──
         const ticketId = `TKT-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
         const formattedDate = getFormattedDate();
         const formattedTime = getFormattedTime();
+        const createdAt = new Date();
 
         const messages = [
-            { sender: 'Admin', text: description, time: formattedTime, isUser: true }
+            { sender: 'Admin', text: trimmedDescription, time: formattedTime, isUser: true }
         ];
 
         const query = `
@@ -49,7 +141,7 @@ const createTicket = async (req, res) => {
             clinicName,
             adminName,
             email,
-            subject,
+            trimmedSubject,
             priority,
             category,
             'Open',
@@ -62,7 +154,7 @@ const createTicket = async (req, res) => {
             message: 'Support ticket raised successfully.',
             data: {
                 id: ticketId,
-                subject,
+                subject: trimmedSubject,
                 priority,
                 category,
                 status: 'Open',
@@ -71,61 +163,50 @@ const createTicket = async (req, res) => {
             }
         });
 
-        // Send email notification to support team (non-blocking)
-        const supportEmail = process.env.SUPPORT_EMAIL || 'support@kiaantechnology.com';
-        const priorityColor = priority === 'High' ? '#dc2626' : priority === 'Medium' ? '#d97706' : '#16a34a';
-        const priorityBg = priority === 'High' ? '#fee2e2' : priority === 'Medium' ? '#fef3c7' : '#dcfce7';
+        // ── 4. Dispatch Notifications Asynchronously (Non-blocking) ──
+        setImmediate(async () => {
+            const supportPayload = {
+                ticketId,
+                adminName,
+                clinicName,
+                clinicId,
+                userId,
+                email,
+                phone,
+                planName,
+                subscriptionStatus,
+                subscriptionStartDate,
+                subscriptionEndDate,
+                subject: trimmedSubject,
+                description: trimmedDescription,
+                priority,
+                category,
+                status: 'Open',
+                createdAt,
+                ticketUrl: resolveTicketUrl(ticketId, true) // SuperAdmin / Support team URL
+            };
 
-        const ticketHtml = `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; background-color: #ffffff;">
-              <div style="background-color: #0f172a; padding: 2.5rem 1rem; text-align: center;">
-                <span style="color: #ffffff; font-weight: 800; font-size: 1.5rem; letter-spacing: 1px;">SUPPORT <span style="color: #3b82f6;">TICKET</span></span>
-              </div>
-              <div style="padding: 2.5rem 2rem;">
-                <h2 style="color: #0f172a; font-size: 1.4rem; font-weight: 600; margin-top: 0; margin-bottom: 1rem;">New Support Request</h2>
-                <p style="color: #64748b; font-size: 1rem; margin-bottom: 2.5rem; line-height: 1.5;">A new support ticket has been submitted. Here are the details:</p>
-                
-                <table style="width: 100%; font-size: 0.95rem; border-collapse: collapse; margin-bottom: 2.5rem;">
-                  <tr>
-                    <td style="padding: 1.25rem 0; color: #475569; font-weight: 600; border-bottom: 1px solid #f1f5f9; width: 40%;">Clinic Name</td>
-                    <td style="padding: 1.25rem 0; color: #0f172a; font-weight: 700; border-bottom: 1px solid #f1f5f9;">${clinicName}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 1.25rem 0; color: #475569; font-weight: 600; border-bottom: 1px solid #f1f5f9;">Admin Name</td>
-                    <td style="padding: 1.25rem 0; border-bottom: 1px solid #f1f5f9;"><a href="mailto:${email}" style="color: #3b82f6; text-decoration: none;">${email}</a></td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 1.25rem 0; color: #475569; font-weight: 600; border-bottom: 1px solid #f1f5f9;">Email Address</td>
-                    <td style="padding: 1.25rem 0; border-bottom: 1px solid #f1f5f9;"><a href="mailto:${email}" style="color: #3b82f6; text-decoration: none;">${email}</a></td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 1.25rem 0; color: #475569; font-weight: 600; border-bottom: 1px solid #f1f5f9;">Category</td>
-                    <td style="padding: 1.25rem 0; color: #334155; border-bottom: 1px solid #f1f5f9;">${category}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 1.25rem 0; color: #475569; font-weight: 600;">Priority</td>
-                    <td style="padding: 1.25rem 0;">
-                      <span style="background-color: ${priorityBg}; color: ${priorityColor}; padding: 0.3rem 0.8rem; border-radius: 9999px; font-weight: 600; font-size: 0.85rem;">${priority}</span>
-                    </td>
-                  </tr>
-                </table>
+            const adminPayload = {
+                ticketId,
+                adminName,
+                subject: trimmedSubject,
+                description: trimmedDescription,
+                priority,
+                category,
+                createdAt,
+                ticketUrl: resolveTicketUrl(ticketId, false) // Clinic Admin URL
+            };
 
-                <div style="background-color: #f8fafc; border-left: 4px solid #3b82f6; padding: 1.5rem; margin-bottom: 1rem;">
-                  <h3 style="color: #0f172a; font-size: 1rem; font-weight: 600; margin-top: 0; margin-bottom: 0.75rem;">Issue Description</h3>
-                  <p style="color: #475569; font-size: 0.95rem; line-height: 1.6; margin: 0; white-space: pre-wrap;">${description}</p>
-                </div>
-              </div>
-              <div style="background-color: #f1f5f9; padding: 1.25rem; text-align: center; color: #94a3b8; font-size: 0.8rem; border-top: 1px solid #e2e8f0;">
-                This is an automated message from the Kiaan Veterinary System.
-              </div>
-            </div>
-        `;
-        emailService.sendEmail({
-            to: supportEmail,
-            subject: `New Support Ticket: ${subject}`,
-            text: `New ticket from ${adminName} (${clinicName}). Subject: ${subject}. Description: ${description}`,
-            html: ticketHtml
-        }).catch(err => console.error('Failed to send ticket notification email:', err));
+            // 1. Notify support team
+            emailService.sendSupportTicketCreatedEmail(supportPayload)
+                .catch(err => console.error('[Email] Failed to send support team ticket notification:', err.message));
+
+            // 2. Confirm to admin requester
+            if (email) {
+                emailService.sendSupportTicketConfirmationEmail(adminPayload)
+                    .catch(err => console.error('[Email] Failed to send admin ticket confirmation:', err.message));
+            }
+        });
 
     } catch (err) {
         console.error('Error creating ticket:', err);
@@ -161,14 +242,14 @@ const getMyTickets = async (req, res) => {
     }
 };
 
-// 3. Clinic User: Reply to their ticket
+// 3. Clinic User: Reply to their ticket (Reopen if closed)
 const replyToTicketAsUser = async (req, res) => {
     try {
         const { id } = req.params;
         const { text } = req.body;
         const sender = req.user?.name || req.user?.email || 'Admin';
 
-        if (!text) {
+        if (!text || !text.trim()) {
             return res.status(400).json({ status: 'error', message: 'Message text is required.' });
         }
 
@@ -232,7 +313,7 @@ const replyTicketAsSuperAdmin = async (req, res) => {
         const { id } = req.params;
         const { text } = req.body;
 
-        if (!text) {
+        if (!text || !text.trim()) {
             return res.status(400).json({ status: 'error', message: 'Reply text is required.' });
         }
 
@@ -269,6 +350,23 @@ const replyTicketAsSuperAdmin = async (req, res) => {
                 messages: updatedMessages
             }
         });
+
+        // Notify admin that there is a new reply (non-blocking)
+        setImmediate(() => {
+            if (ticket.email) {
+                emailService.sendSupportTicketStatusEmail({
+                    ticketId: ticket.id,
+                    adminName: ticket.adminName || ticket.email,
+                    email: ticket.email,
+                    subject: ticket.subject,
+                    newStatus: 'Replied',
+                    latestReply: text.trim(),
+                    updatedAt: new Date(),
+                    ticketUrl: resolveTicketUrl(ticket.id, false)
+                }).catch(err => console.error('[Email] Failed to send ticket reply notification:', err.message));
+            }
+        });
+
     } catch (err) {
         console.error('Error replying as SuperAdmin:', err);
         res.status(500).json({ status: 'error', message: 'Failed to post reply.' });
@@ -279,7 +377,7 @@ const replyTicketAsSuperAdmin = async (req, res) => {
 const updateTicketStatus = async (req, res) => {
     try {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, resolution } = req.body;
 
         if (!status) {
             return res.status(400).json({ status: 'error', message: 'Status is required.' });
@@ -290,6 +388,7 @@ const updateTicketStatus = async (req, res) => {
             return res.status(404).json({ status: 'error', message: 'Ticket not found.' });
         }
 
+        const ticket = rows[0];
         const updatedDate = getFormattedDate();
 
         await db.query(
@@ -302,6 +401,37 @@ const updateTicketStatus = async (req, res) => {
             message: 'Ticket status updated successfully.',
             data: { id, status, updated: updatedDate }
         });
+
+        // Send appropriate email to admin based on new status (non-blocking)
+        setImmediate(() => {
+            if (!ticket.email) return;
+
+            const emailBase = {
+                ticketId: ticket.id,
+                adminName: ticket.adminName || ticket.email,
+                email: ticket.email,
+                subject: ticket.subject,
+                priority: ticket.priority,
+                updatedAt: new Date(),
+                ticketUrl: resolveTicketUrl(ticket.id, false)
+            };
+
+            if (status === 'Closed') {
+                emailService.sendSupportTicketClosedEmail({
+                    ...emailBase,
+                    resolution: resolution || null,
+                    closedAt: new Date()
+                }).catch(err => console.error('[Email] Failed to send ticket-closed email:', err.message));
+            } else {
+                // For all other status changes (Resolved, In Progress, etc.) — send status update email
+                emailService.sendSupportTicketStatusEmail({
+                    ...emailBase,
+                    newStatus: status,
+                    latestReply: resolution || null
+                }).catch(err => console.error('[Email] Failed to send ticket-status email:', err.message));
+            }
+        });
+
     } catch (err) {
         console.error('Error updating ticket status:', err);
         res.status(500).json({ status: 'error', message: 'Failed to update status.' });

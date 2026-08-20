@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const emailService = require('../services/emailService');
+const { SUPERADMIN_EMAIL } = require('../config/emailConfig');
 
 async function checkExpiries() {
     console.log('Running daily subscription cron job...');
@@ -30,7 +31,7 @@ async function checkExpiries() {
                     <p>Hello ${record.admin_name},</p>
                     <p>This is a friendly reminder that your VetCare Pro ${isTrial ? 'Free Trial' : 'Subscription'} for <strong>${record.clinic_name}</strong> will expire in 2 days on ${new Date(record.end_date).toLocaleDateString()}.</p>
                     <p>To avoid any interruption in service, please log in to your account and upgrade/renew your plan.</p>
-                    <a href="${process.env.FRONTEND_URL || 'http://localhost:5174'}/login" style="display:inline-block; padding: 10px 20px; background-color: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 15px;">Login to Renew</a>
+                    <a href="${(process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5174').trim().replace(/\/+$/, '')}/login" style="display:inline-block; padding: 10px 20px; background-color: #6366f1; color: white; text-decoration: none; border-radius: 5px; margin-top: 15px;">Login to Renew</a>
                     <p style="margin-top: 30px;">Thank you,<br/>Kiaan Technology Pvt Ltd</p>
                 </div>
             `;
@@ -47,7 +48,7 @@ async function checkExpiries() {
             // Notify SuperAdmin
             try {
                 await emailService.sendEmail({
-                    to: 'ashilatasaket.rewa@gmail.com',
+                    to: SUPERADMIN_EMAIL,
                     subject: `Alert: ${record.clinic_name} ${isTrial ? 'Trial' : 'Subscription'} Expiring Soon`,
                     text: `Clinic: ${record.clinic_name}\nAdmin: ${record.admin_name} (${record.email})\nStatus: Expiring in 2 days (on ${new Date(record.end_date).toLocaleDateString()})`
                 });
@@ -70,7 +71,7 @@ async function checkExpiries() {
         for (const record of expiredAccounts) {
             const isTrial = record.status === 'Trial';
             const expiryDate = new Date(record.end_date).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
-            const loginUrl = process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/login` : 'http://localhost:5174/login';
+            const loginUrl = `${(process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5174').trim().replace(/\/+$/, '')}/login`;
 
             // Update subscription status to Expired in DB
             await db.query(
@@ -124,7 +125,7 @@ async function checkExpiries() {
             // Notify SuperAdmin
             try {
                 await emailService.sendEmail({
-                    to: 'ashilatasaket.rewa@gmail.com',
+                    to: SUPERADMIN_EMAIL,
                     subject: `Alert: ${record.clinic_name} ${isTrial ? 'Trial' : 'Subscription'} EXPIRED`,
                     text: `Clinic: ${record.clinic_name}\nAdmin: ${record.admin_name} (${record.email})\nStatus: EXPIRED on ${expiryDate}`
                 });

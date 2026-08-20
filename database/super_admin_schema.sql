@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS saas_subscriptions (
     end_date DATE,
     razorpay_payment_id VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (clinic_id) REFERENCES Clinics(id) ON DELETE CASCADE,
-    FOREIGN KEY (clinic_admin_id) REFERENCES Users(id) ON DELETE SET NULL,
+    FOREIGN KEY (clinic_id) REFERENCES clinics(id) ON DELETE CASCADE,
+    FOREIGN KEY (clinic_admin_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (plan_id) REFERENCES saas_plans(id) ON DELETE SET NULL
 );
 
@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS saas_payments (
     invoice_number VARCHAR(255),
     payment_method VARCHAR(50),
     currency VARCHAR(10) DEFAULT 'INR',
-    FOREIGN KEY (clinic_id) REFERENCES Clinics(id) ON DELETE CASCADE,
-    FOREIGN KEY (clinic_admin_id) REFERENCES Users(id) ON DELETE SET NULL
+    FOREIGN KEY (clinic_id) REFERENCES clinics(id) ON DELETE CASCADE,
+    FOREIGN KEY (clinic_admin_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS saas_support_tickets (
@@ -59,8 +59,8 @@ CREATE TABLE IF NOT EXISTS saas_support_tickets (
     message TEXT NOT NULL,
     status ENUM('Open', 'In Progress', 'Closed') DEFAULT 'Open',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (clinic_id) REFERENCES Clinics(id) ON DELETE CASCADE,
-    FOREIGN KEY (clinic_admin_id) REFERENCES Users(id) ON DELETE SET NULL
+    FOREIGN KEY (clinic_id) REFERENCES clinics(id) ON DELETE CASCADE,
+    FOREIGN KEY (clinic_admin_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS saas_system_settings (

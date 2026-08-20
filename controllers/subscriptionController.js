@@ -1,45 +1,22 @@
 const db = require('../config/db');
 
+const subscriptionService = require('../services/subscriptionService');
+
 // @desc    Get Current Clinic Subscription
 // @route   GET /api/subscriptions/current
 // @access  Private
 const getCurrentSubscription = async (req, res) => {
     try {
-        const clinicId = req.user.clinicId;
-
-        // Fetch subscription and plan info
-        const [subs] = await db.query(`
-            SELECT 
-                s.id, s.status as subStatus, s.start_date as startDate, s.end_date as endDate,
-                p.id as planId, p.name as planName, p.price, p.features,
-                c.status as clinicStatus
-            FROM saas_subscriptions s
-            JOIN saas_plans p ON s.plan_id = p.id
-            JOIN clinics c ON s.clinic_id = c.id
-            WHERE s.clinic_id = ?
-            ORDER BY s.created_at DESC
-            LIMIT 1
-        `, [clinicId]);
-
-        if (subs.length === 0) {
-            return res.status(404).json({ status: 'error', message: 'No subscription found' });
+        const clinicId = req.user?.clinicId || req.user?.clinic_id || req.clinicId;
+        if (!clinicId) {
+            return res.status(401).json({ status: 'error', message: 'No clinic context found' });
         }
 
-        const sub = subs[0];
-        // Calculate days left
-        const end = new Date(sub.endDate);
-        const now = new Date();
-        const diffTime = end - now;
-        const daysLeft = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        const entitlements = await subscriptionService.getAdminEntitlements(clinicId);
 
         res.json({
             status: 'success',
-            data: {
-                ...sub,
-                features: sub.features ? JSON.parse(sub.features) : [],
-                daysLeft: daysLeft > 0 ? daysLeft : 0,
-                isExpired: daysLeft <= 0 || sub.subStatus === 'Expired' || sub.clinicStatus === 'EXPIRED'
-            }
+            data: entitlements
         });
     } catch (error) {
         console.error('Error fetching current subscription:', error);

@@ -1,5 +1,6 @@
 const https = require('https');
 const nodemailer = require('nodemailer');
+const emailConfig = require('../config/emailConfig');
 
 class EmailService {
     constructor() {
@@ -25,8 +26,8 @@ class EmailService {
         }
 
         const apiKey = process.env.BREVO_API_KEY;
-        const senderEmail = process.env.SMTP_FROM_EMAIL || 'lightlabcreation@gmail.com';
-        const senderName = process.env.SMTP_FROM_NAME || 'Kiaan Technology Pvt Ltd';
+        const senderEmail = emailConfig.SENDER_EMAIL;
+        const senderName = emailConfig.SENDER_NAME;
 
         // 1. If Brevo API Key is configured, use Brevo HTTP API directly
         if (apiKey) {
@@ -127,7 +128,128 @@ class EmailService {
         console.log('==================================================\n');
         return { success: true, simulated: true, messageId: 'sim-' + Math.random().toString(36).substring(2, 9) };
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Welcome Email
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Send standardized Welcome Email to newly registered Clinic Admin.
+     * BCC is automatically sent to the SuperAdmin.
+     */
+    async sendWelcomeEmail(options) {
+        const { generateWelcomeEmail } = require('../templates/welcomeEmail');
+        const { subject, html, text } = generateWelcomeEmail(options);
+
+        return await this.sendEmail({
+            to: options.email,
+            bcc: emailConfig.SUPERADMIN_EMAIL,
+            subject,
+            html,
+            text
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Plan Purchase Emails
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Send payment receipt to the Admin after successful plan purchase.
+     */
+    async sendPlanPurchaseEmail(options) {
+        const { generatePlanPurchaseEmail } = require('../templates/planPurchaseEmail');
+        const { subject, html, text } = generatePlanPurchaseEmail(options);
+
+        return await this.sendEmail({
+            to: options.email,
+            subject,
+            html,
+            text
+        });
+    }
+
+    /**
+     * Send plan purchase alert to SuperAdmin.
+     */
+    async sendSuperAdminPurchaseNotification(options) {
+        const { generateSuperAdminPurchaseEmail } = require('../templates/planPurchaseEmail');
+        const { subject, html, text } = generateSuperAdminPurchaseEmail(options);
+
+        return await this.sendEmail({
+            to: emailConfig.SUPERADMIN_EMAIL,
+            subject,
+            html,
+            text
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Support Ticket Emails
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Notify the support team of a newly created ticket.
+     */
+    async sendSupportTicketCreatedEmail(options) {
+        const { generateSupportTicketCreatedEmail } = require('../templates/supportTicketEmail');
+        const { subject, html, text } = generateSupportTicketCreatedEmail(options);
+
+        return await this.sendEmail({
+            to: emailConfig.SUPPORT_EMAIL,
+            subject,
+            html,
+            text
+        });
+    }
+
+    /**
+     * Send ticket-created confirmation to the Admin who opened the ticket.
+     */
+    async sendSupportTicketConfirmationEmail(options) {
+        const { generateSupportTicketConfirmationEmail } = require('../templates/supportTicketEmail');
+        const { subject, html, text } = generateSupportTicketConfirmationEmail(options);
+
+        return await this.sendEmail({
+            to: options.email,
+            subject,
+            html,
+            text
+        });
+    }
+
+    /**
+     * Notify Admin that their ticket has been closed.
+     */
+    async sendSupportTicketClosedEmail(options) {
+        const { generateSupportTicketClosedEmail } = require('../templates/supportTicketEmail');
+        const { subject, html, text } = generateSupportTicketClosedEmail(options);
+
+        return await this.sendEmail({
+            to: options.email,
+            subject,
+            html,
+            text
+        });
+    }
+
+    /**
+     * Notify Admin of a ticket status change (Replied, In Progress, Resolved, etc.)
+     */
+    async sendSupportTicketStatusEmail(options) {
+        const { generateSupportTicketStatusEmail } = require('../templates/supportTicketEmail');
+        const { subject, html, text } = generateSupportTicketStatusEmail(options);
+
+        return await this.sendEmail({
+            to: options.email,
+            subject,
+            html,
+            text
+        });
+    }
 }
 
 module.exports = new EmailService();
+
+
 
