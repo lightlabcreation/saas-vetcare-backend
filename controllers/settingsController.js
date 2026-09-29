@@ -13,6 +13,12 @@ const ensureTableExists = async () => {
             await db.query(`ALTER TABLE Clinic_Settings ADD PRIMARY KEY (clinic_id)`);
             await db.query(`ALTER TABLE Clinic_Settings ADD CONSTRAINT fk_clinic_settings_clinic FOREIGN KEY (clinic_id) REFERENCES clinics(id)`);
         }
+
+        // Check for currency columns
+        const [currCols] = await db.query("SHOW COLUMNS FROM Clinic_Settings LIKE 'currency'");
+        if (currCols.length === 0) {
+            await db.query(`ALTER TABLE Clinic_Settings ADD COLUMN currency VARCHAR(10) DEFAULT 'USD', ADD COLUMN currency_symbol VARCHAR(10) DEFAULT '$'`);
+        }
     } catch (e) {
         // Table doesn't exist, create it
         await db.query(`
@@ -26,6 +32,8 @@ const ensureTableExists = async () => {
                 logo VARCHAR(255),
                 autoEmail BOOLEAN DEFAULT TRUE,
                 reminderTime VARCHAR(10) DEFAULT '24h',
+                currency VARCHAR(10) DEFAULT 'USD',
+                currency_symbol VARCHAR(10) DEFAULT '$',
                 FOREIGN KEY (clinic_id) REFERENCES clinics(id)
             )
         `);
@@ -45,10 +53,10 @@ const checkTable = async () => {
 
 const seedSettings = async (clinic_id) => {
     await db.query(`
-        INSERT IGNORE INTO Clinic_Settings (clinic_id, name, email, phone, address, primaryThemeColor, logo, autoEmail, reminderTime)
-        VALUES (?, 'VetCare Pro Animal Hospital', 'info@vetcarepro.com', '+94 11 234 5678', 'No. 45, Temple Road, Colombo 07, Sri Lanka', '#14b8a6', 'https://images.unsplash.com/photo-1576091160550-2173dba999ef?auto=format&fit=crop&q=80&w=150', TRUE, '24h')
+        INSERT IGNORE INTO Clinic_Settings (clinic_id, name, email, phone, address, primaryThemeColor, logo, autoEmail, reminderTime, currency, currency_symbol)
+        VALUES (?, 'VetCare Pro Animal Hospital', 'info@vetcarepro.com', '+94 11 234 5678', 'No. 45, Temple Road, Colombo 07, Sri Lanka', '#14b8a6', 'https://images.unsplash.com/photo-1576091160550-2173dba999ef?auto=format&fit=crop&q=80&w=150', TRUE, '24h', 'USD', '$')
     `, [clinic_id]);
-}
+};
 
 exports.getSettings = async (req, res) => {
     try {
@@ -89,12 +97,14 @@ exports.updateSettings = async (req, res) => {
         const logo = req.body.logo !== undefined ? req.body.logo : currentSettings.logo;
         const autoEmail = req.body.autoEmail !== undefined ? req.body.autoEmail : currentSettings.autoEmail;
         const reminderTime = req.body.reminderTime !== undefined ? req.body.reminderTime : currentSettings.reminderTime;
+        const currency = req.body.currency !== undefined ? req.body.currency : (currentSettings.currency || 'USD');
+        const currency_symbol = (req.body.currency_symbol !== undefined ? req.body.currency_symbol : (req.body.currencySymbol !== undefined ? req.body.currencySymbol : (currentSettings.currency_symbol || '$')));
 
         await db.query(
             `UPDATE Clinic_Settings 
-             SET name = ?, email = ?, phone = ?, address = ?, primaryThemeColor = ?, logo = ?, autoEmail = ?, reminderTime = ? 
+             SET name = ?, email = ?, phone = ?, address = ?, primaryThemeColor = ?, logo = ?, autoEmail = ?, reminderTime = ?, currency = ?, currency_symbol = ? 
              WHERE clinic_id = ?`,
-            [name, email, phone, address, primaryThemeColor, logo, autoEmail, reminderTime, clinic_id]
+            [name, email, phone, address, primaryThemeColor, logo, autoEmail, reminderTime, currency, currency_symbol, clinic_id]
         );
 
         const [rows] = await db.query('SELECT * FROM Clinic_Settings WHERE clinic_id = ?', [clinic_id]);

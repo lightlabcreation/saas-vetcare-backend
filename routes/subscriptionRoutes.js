@@ -6,7 +6,7 @@ const { protect } = require('../middlewares/authMiddleware');
 // Get current subscription for logged in clinic
 router.get('/current', protect, getCurrentSubscription);
 
-// Get all active plans (can be public or protected, protecting it for now)
-router.get('/plans', protect, getActivePlans);
+// Get all active plans (Public for pricing/checkout)
+router.get('/plans', getActivePlans);
 
 module.exports = router;

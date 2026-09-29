@@ -77,8 +77,14 @@ const getClinics = async (req, res) => {
                 p.price as plan_price
             FROM clinics c
             LEFT JOIN users u ON u.clinic_id = c.id AND u.role = 'Admin'
-            LEFT JOIN saas_subscriptions s ON s.clinic_id = c.id
+            LEFT JOIN saas_subscriptions s ON s.id = (
+                SELECT s2.id FROM saas_subscriptions s2 
+                WHERE s2.clinic_id = c.id 
+                ORDER BY s2.created_at DESC 
+                LIMIT 1
+            )
             LEFT JOIN saas_plans p ON p.id = s.plan_id
+            GROUP BY c.id
             ORDER BY c.created_at DESC
         `);
 
@@ -145,6 +151,29 @@ const getStats = async (req, res) => {
             WHERE status = 'Open'
         `);
 
+        const [upcomingRenewals] = await db.query(`
+            SELECT 
+                s.id,
+                c.clinic_name as clinic,
+                u.name as owner,
+                s.end_date as expiry,
+                p.name as plan,
+                p.id as planType
+            FROM clinics c
+            INNER JOIN saas_subscriptions s ON s.id = (
+                SELECT s2.id FROM saas_subscriptions s2 
+                WHERE s2.clinic_id = c.id 
+                ORDER BY s2.created_at DESC 
+                LIMIT 1
+            )
+            LEFT JOIN users u ON u.clinic_id = c.id AND u.role = 'Admin'
+            LEFT JOIN saas_plans p ON p.id = s.plan_id
+            WHERE s.end_date IS NOT NULL
+            GROUP BY c.id
+            ORDER BY s.end_date ASC
+            LIMIT 10
+        `);
+
         const stats = {
             totalClinics: clinicStats[0]?.total_clinics || 0,
             activeClinics: clinicStats[0]?.active_clinics || 0,
@@ -156,13 +185,70 @@ const getStats = async (req, res) => {
             totalPatients: petStats[0]?.total_pets || 0,
             totalRevenue: paymentStats[0]?.total_revenue || 0,
             totalPayments: paymentStats[0]?.total_payments || 0,
-            openSupportTickets: ticketStats[0]?.open_tickets || 0
+            openSupportTickets: ticketStats[0]?.open_tickets || 0,
+            upcomingRenewals: upcomingRenewals || []
         };
 
         res.json({ status: 'success', data: stats });
     } catch (error) {
         console.error('Error fetching stats:', error);
         res.status(500).json({ status: 'error', message: 'Failed to fetch stats' });
+    }
+};
+
+// @desc    Get All SaaS Payments
+// @route   GET /api/super-admin/payments
+// @access  Private (SUPER_ADMIN)
+const getPayments = async (req, res) => {
+    try {
+        const [payments] = await db.query(`
+            SELECT 
+                p.id,
+                p.razorpay_order_id as orderId,
+                p.razorpay_payment_id as paymentId,
+                c.clinic_name as clinic,
+                p.payment_date as date,
+                p.amount,
+                p.payment_method as method,
+                p.status,
+                p.invoice_number as invoice
+            FROM saas_payments p
+            LEFT JOIN clinics c ON c.id = p.clinic_id
+            ORDER BY p.payment_date DESC
+        `);
+
+        res.json({ status: 'success', data: payments });
+    } catch (error) {
+        console.error('Error fetching payments:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch payments' });
+    }
+};
+
+// @desc    Get All SaaS Subscriptions
+// @route   GET /api/super-admin/subscriptions
+// @access  Private (SUPER_ADMIN)
+const getSubscriptions = async (req, res) => {
+    try {
+        const [subs] = await db.query(`
+            SELECT 
+                s.id,
+                c.clinic_name as clinicName,
+                c.email,
+                p.name as plan,
+                s.status,
+                'Monthly' as billingCycle,
+                s.end_date as nextBilling,
+                p.price as amount
+            FROM saas_subscriptions s
+            LEFT JOIN clinics c ON c.id = s.clinic_id
+            LEFT JOIN saas_plans p ON p.id = s.plan_id
+            ORDER BY s.created_at DESC
+        `);
+
+        res.json({ status: 'success', data: subs });
+    } catch (error) {
+        console.error('Error fetching subscriptions:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch subscriptions' });
     }
 };
 
@@ -179,15 +265,19 @@ const suspendClinic = async (req, res) => {
             [id]
         );
 
-        await createAuditLog({
-            userId: req.user.id,
-            clinicId: id,
-            action: 'CLINIC_SUSPENDED',
-            entity: 'clinic',
-            entityId: id,
-            newValues: { status: 'SUSPENDED', reason },
-            req
-        });
+        try {
+            await createAuditLog({
+                userId: null,
+                clinicId: id,
+                action: 'CLINIC_SUSPENDED',
+                entity: 'clinic',
+                entityId: id,
+                newValues: { status: 'SUSPENDED', reason },
+                req
+            });
+        } catch (auditErr) {
+            // ignore
+        }
 
         res.json({ status: 'success', message: 'Clinic suspended successfully' });
     } catch (error) {
@@ -208,15 +298,19 @@ const activateClinic = async (req, res) => {
             [id]
         );
 
-        await createAuditLog({
-            userId: req.user.id,
-            clinicId: id,
-            action: 'CLINIC_ACTIVATED',
-            entity: 'clinic',
-            entityId: id,
-            newValues: { status: 'ACTIVE' },
-            req
-        });
+        try {
+            await createAuditLog({
+                userId: null,
+                clinicId: id,
+                action: 'CLINIC_ACTIVATED',
+                entity: 'clinic',
+                entityId: id,
+                newValues: { status: 'ACTIVE' },
+                req
+            });
+        } catch (auditErr) {
+            // ignore
+        }
 
         res.json({ status: 'success', message: 'Clinic activated successfully' });
     } catch (error) {
@@ -225,172 +319,118 @@ const activateClinic = async (req, res) => {
     }
 };
 
-// @desc    Get Payments / Transactions
-// @route   GET /api/super-admin/payments
+// @desc    Delete Clinic & Associated Data
+// @route   DELETE /api/super-admin/clinics/:id
 // @access  Private (SUPER_ADMIN)
-const getPayments = async (req, res) => {
+const deleteClinic = async (req, res) => {
+    let connection;
     try {
-        const [payments] = await db.query(`
-            SELECT 
-                p.id,
-                p.razorpay_order_id as orderId,
-                p.razorpay_payment_id as paymentId,
-                p.amount,
-                p.currency,
-                p.status,
-                p.payment_method as method,
-                p.invoice_number as invoice,
-                p.payment_date as date,
-                c.clinic_name as clinic,
-                u.email as admin_email
-            FROM saas_payments p
-            LEFT JOIN clinics c ON c.id = p.clinic_id
-            LEFT JOIN users u ON u.id = p.clinic_admin_id
-            ORDER BY p.payment_date DESC
-        `);
+        const { id } = req.params;
+        connection = await db.getConnection();
+        await connection.beginTransaction();
 
-        const formatted = payments.map(p => ({
-            id: p.id,
-            orderId: p.orderId || '-',
-            paymentId: p.paymentId || '-',
-            clinic: p.clinic || 'General Clinic',
-            email: p.admin_email || '-',
-            date: p.date ? new Date(p.date).toLocaleString('en-IN') : '-',
-            amount: `₹${Number(p.amount || 0).toLocaleString('en-IN')}`,
-            method: p.method ? `Razorpay (${p.method})` : 'Razorpay Gateway',
-            status: p.status || 'Pending',
-            invoice: p.invoice || '-'
-        }));
+        // Temporarily disable foreign key checks to allow clean cascade deletion
+        await connection.query('SET FOREIGN_KEY_CHECKS = 0');
 
-        res.json({ status: 'success', data: formatted });
+        // All tables that may contain clinic_id references
+        const tables = [
+            'invoice_line_items',
+            'invoices',
+            'billing_invoice_items',
+            'billing_invoices',
+            'prescriptions',
+            'treatment_notes',
+            'diagnostic_reports',
+            'clinical_encounters',
+            'home_visits',
+            'hospitalization_cages',
+            'hospitalizations',
+            'inpatient_treatments',
+            'inpatient_vitals',
+            'email_reminders',
+            'reminders',
+            'notification_logs',
+            'notifications',
+            'staff_attendance',
+            'inventory_items',
+            'inventory',
+            'appointments',
+            'pets',
+            'pet_owners',
+            'saas_payments',
+            'saas_support_tickets',
+            'saas_subscriptions',
+            'clinic_settings',
+            'system_settings',
+            'audit_logs',
+            'users'
+        ];
+
+        for (const tbl of tables) {
+            try {
+                await connection.query(`DELETE FROM ${tbl} WHERE clinic_id = ?`, [id]);
+            } catch (tblErr) {
+                // Ignore if table/column does not exist in schema
+            }
+        }
+
+        // Delete clinic master row
+        await connection.query('DELETE FROM clinics WHERE id = ?', [id]);
+
+        // Re-enable foreign key checks
+        await connection.query('SET FOREIGN_KEY_CHECKS = 1');
+
+        await connection.commit();
+
+        try {
+            await createAuditLog({
+                userId: null,
+                clinicId: id,
+                action: 'CLINIC_DELETED',
+                entity: 'clinic',
+                entityId: id,
+                req
+            });
+        } catch (auditErr) {
+            // Ignore audit log write failure
+        }
+
+        res.json({ status: 'success', message: 'Clinic and all associated records deleted successfully' });
     } catch (error) {
-        console.error('Error fetching superadmin payments:', error);
-        res.status(500).json({ status: 'error', message: 'Failed to fetch payments' });
+        if (connection) {
+            try {
+                await connection.query('SET FOREIGN_KEY_CHECKS = 1');
+                await connection.rollback();
+            } catch (rbErr) {}
+        }
+        console.error('Error deleting clinic:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to delete clinic', error: error.message });
+    } finally {
+        if (connection) connection.release();
     }
 };
 
-// @desc    Get Subscriptions
-// @route   GET /api/super-admin/subscriptions
+// @desc    Update Clinic Details
+// @route   PUT /api/super-admin/clinics/:id
 // @access  Private (SUPER_ADMIN)
-const getSubscriptions = async (req, res) => {
+const updateClinic = async (req, res) => {
     try {
-        const [subs] = await db.query(`
-            SELECT 
-                s.id,
-                s.status,
-                s.start_date,
-                s.end_date,
-                s.created_at,
-                c.clinic_name,
-                c.email,
-                p.name as plan_name,
-                p.price as plan_price,
-                p.duration_days
-            FROM saas_subscriptions s
-            LEFT JOIN clinics c ON c.id = s.clinic_id
-            LEFT JOIN saas_plans p ON p.id = s.plan_id
-            ORDER BY s.created_at DESC
-        `);
+        const { id } = req.params;
+        const { name, email, phone, address, city, state, country, status, adminName } = req.body;
 
-        const formatted = subs.map(s => ({
-            id: s.id,
-            clinicName: s.clinic_name || 'Clinic',
-            email: s.email || '-',
-            plan: s.plan_name || 'Standard',
-            status: s.status || 'Active',
-            billingCycle: s.duration_days > 30 ? 'Annual' : 'Monthly',
-            nextBilling: s.end_date ? new Date(s.end_date).toISOString().split('T')[0] : '-',
-            amount: `₹${Number(s.plan_price || 0).toLocaleString('en-IN')}`
-        }));
+        await db.query(
+            `UPDATE clinics SET clinic_name = COALESCE(?, clinic_name), email = COALESCE(?, email), phone = COALESCE(?, phone), address = COALESCE(?, address), city = COALESCE(?, city), state = COALESCE(?, state), country = COALESCE(?, country), status = COALESCE(?, status), updated_at = NOW() WHERE id = ?`,
+            [name, email, phone, address, city, state, country, status, id]
+        );
 
-        res.json({ status: 'success', data: formatted });
+        if (adminName) {
+            await db.query(`UPDATE users SET name = ? WHERE clinic_id = ? AND role = 'Admin'`, [adminName, id]);
+        }
+
+        res.json({ status: 'success', message: 'Clinic details updated successfully' });
     } catch (error) {
-        console.error('Error fetching subscriptions:', error);
-        res.status(500).json({ status: 'error', message: 'Failed to fetch subscriptions' });
-    }
-};
-
-// @desc    Get Plans
-// @route   GET /api/super-admin/plans
-// @access  Private (SUPER_ADMIN)
-const getPlans = async (req, res) => {
-    try {
-        const [plans] = await db.query('SELECT * FROM saas_plans ORDER BY price ASC');
-        const formatted = plans.map(p => ({
-            id: p.id,
-            name: p.name,
-            price: `₹${Number(p.price || 0).toLocaleString('en-IN')}`,
-            priceRaw: Number(p.price || 0),
-            interval: p.duration_days === 7 ? '7 days trial' : (p.duration_days > 30 ? 'per year' : 'per month'),
-            duration_days: p.duration_days,
-            features: p.features ? (typeof p.features === 'string' ? JSON.parse(p.features) : p.features) : [],
-            color: p.name.toLowerCase().includes('trial') ? '#f59e0b' : (p.name.toLowerCase().includes('pro') ? '#8b5cf6' : '#14b8a6'),
-            badgeText: p.name.toLowerCase().includes('trial') ? 'Trial Plan' : (p.name.toLowerCase().includes('pro') ? 'Unlimited' : 'Most Popular'),
-            isPopular: p.name.toLowerCase().includes('standard') || p.name.toLowerCase().includes('pro')
-        }));
-
-        res.json({ status: 'success', data: formatted });
-    } catch (error) {
-        console.error('Error fetching plans for superadmin:', error);
-        res.status(500).json({ status: 'error', message: 'Failed to fetch plans' });
-    }
-};
-
-// @desc    Get SuperAdmin Notifications
-// @route   GET /api/super-admin/notifications
-// @access  Private (SUPER_ADMIN)
-const getNotifications = async (req, res) => {
-    try {
-        const [recentClinics] = await db.query('SELECT clinic_name, created_at FROM clinics ORDER BY created_at DESC LIMIT 5');
-        const [recentPayments] = await db.query('SELECT amount, payment_date FROM saas_payments WHERE status = "Successful" ORDER BY payment_date DESC LIMIT 5');
-        const [recentTickets] = await db.query('SELECT subject, priority, created_at FROM saas_support_tickets ORDER BY created_at DESC LIMIT 5');
-
-        const notifs = [];
-        let idCounter = 1;
-
-        recentClinics.forEach(c => {
-            notifs.push({
-                id: idCounter++,
-                type: 'user',
-                title: 'New Clinic Registered',
-                desc: `${c.clinic_name} registered on the platform.`,
-                time: new Date(c.created_at).toLocaleDateString('en-IN'),
-                iconName: 'UserPlus',
-                color: '#34d399',
-                bg: 'rgba(52,211,153,0.1)'
-            });
-        });
-
-        recentPayments.forEach(p => {
-            notifs.push({
-                id: idCounter++,
-                type: 'billing',
-                title: 'Payment Received',
-                desc: `Received subscription payment of ₹${Number(p.amount || 0).toLocaleString('en-IN')}`,
-                time: new Date(p.payment_date).toLocaleDateString('en-IN'),
-                iconName: 'CreditCard',
-                color: '#38bdf8',
-                bg: 'rgba(56,189,248,0.1)'
-            });
-        });
-
-        recentTickets.forEach(t => {
-            notifs.push({
-                id: idCounter++,
-                type: 'alert',
-                title: 'Support Ticket Raised',
-                desc: `${t.subject} [Priority: ${t.priority}]`,
-                time: new Date(t.created_at).toLocaleDateString('en-IN'),
-                iconName: 'ShieldAlert',
-                color: '#facc15',
-                bg: 'rgba(250,204,21,0.1)'
-            });
-        });
-
-        res.json({ status: 'success', data: notifs });
-    } catch (error) {
-        console.error('Error fetching notifications:', error);
-        res.status(500).json({ status: 'error', message: 'Failed to fetch notifications' });
+        console.error('Error updating clinic:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to update clinic', error: error.message });
     }
 };
 
@@ -398,11 +438,10 @@ module.exports = {
     loginSuperAdmin,
     getClinics,
     getStats,
-    suspendClinic,
-    activateClinic,
     getPayments,
     getSubscriptions,
-    getPlans,
-    getNotifications
+    suspendClinic,
+    activateClinic,
+    deleteClinic,
+    updateClinic
 };
-
