@@ -11,4 +11,11 @@ router.get('/backup/history', protect, systemController.getBackupHistory);
 router.get('/storage/settings', protect, systemController.getStorageSettings);
 router.post('/storage/settings', protect, systemController.updateStorageSettings);
 
+// 7-Day Email Report Endpoints (Protected)
+router.post('/report/send-email', protect, systemController.sendReportEmail);
+router.get('/report/history', protect, systemController.getReportHistory);
+router.post('/report/subscribe', protect, systemController.subscribeReportEmail);
+router.post('/report/unsubscribe', protect, systemController.unsubscribeReportEmail);
+router.get('/report/subscriptions', protect, systemController.getReportSubscriptions);
+
 module.exports = router;

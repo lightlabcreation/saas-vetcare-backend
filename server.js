@@ -139,4 +139,21 @@ app.use(errorHandler);
 // Start Server
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
+
+    // Start Cron Jobs
+    try {
+        const { startCron } = require('./cron/subscriptionCron');
+        startCron();
+        console.log('✅ Subscription expiry cron started (24h interval)');
+    } catch (err) {
+        console.error('Failed to start subscription cron:', err.message);
+    }
+
+    try {
+        const { startWeeklyReportCron } = require('./cron/weeklyReportCron');
+        startWeeklyReportCron();
+        console.log('✅ Weekly 7-day report cron started (7-day interval)');
+    } catch (err) {
+        console.error('Failed to start weekly report cron:', err.message);
+    }
 });
